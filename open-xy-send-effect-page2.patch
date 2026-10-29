@@ -1,0 +1,245 @@
+diff --git a/sdk/platform/opxy-1.2.1/fx_object.cpp.in b/sdk/platform/opxy-1.2.1/fx_object.cpp.in
+index 558202b..30fa191 100644
+--- a/sdk/platform/opxy-1.2.1/fx_object.cpp.in
++++ b/sdk/platform/opxy-1.2.1/fx_object.cpp.in
+@@ -5,6 +5,7 @@
+ // fx.cpp includes its own core.h, resolved next to it rather than on the
+ // shared include path where another machine's core.h may come first.
+ #include "fx.cpp"
++extern "C" opxy::u32 sdk_fx_slot(opxy::u32) __asm__("sdk_fx_slot");
+ extern "C" {
+ void* @PREFIX@_fx_factory(void*) __asm__("@PREFIX@_fx_factory");
+ const char* @PREFIX@_fx_parameter_name(opxy::u32) __asm__("@PREFIX@_fx_parameter_name");
+@@ -17,6 +18,10 @@ static_assert(sizeof(Object) <= 480, "Stock FX slots hold 480 bytes");
+ static_assert(__builtin_offsetof(Object, state) == 4, "FX object header mismatch");
+ extern "C" {
+ extern const void* const @PREFIX@_fx_vtable[];
++const opxy::i32* sdk_fx_route(opxy::u32, const opxy::i32*, opxy::i32*) __asm__("sdk_fx_route");
++void sdk_fx_init(opxy::u32) __asm__("sdk_fx_init");
++void sdk_fx_post(opxy::u32, opxy::i32*, opxy::i32*) __asm__("sdk_fx_post");
++opxy::i32 sdk_fx_dry(opxy::i32, const void*) __asm__("sdk_fx_dry");
+ static void* destroy(void* self) { return self; }
+ static int zero() { return 0; }
+ static void noop() {}
+@@ -24,13 +29,18 @@ static void noop() {}
+ // stock slot index: the track's, so 14 and 15 are the two sends.
+ static void init(void* self, opxy::u32 slot) {
+     Object* object = static_cast<Object*>(self);
++    object->slot = slot;
++    sdk_fx_init(slot);
+ @INIT@
+     @NAMESPACE@::initialize(object->state);
+ }
+ // +0x10: one 64-sample block, left and right processed in place.
+ static void process(void* self, opxy::i32* left, opxy::i32* right, const opxy::i32* parameters) {
+     Object* object = static_cast<Object*>(self);
+-    @NAMESPACE@::process(object->state, @BUFFER@@TRANSPORT@left, right, parameters);
++    opxy::i32 routed[opxy::parameter_slots];
++    const opxy::i32* active = sdk_fx_route(object->slot, parameters, routed);
++    @NAMESPACE@::process(object->state, @BUFFER@@TRANSPORT@left, right, active);
++    sdk_fx_post(object->slot, left, right);
+ }
+ void* @PREFIX@_fx_factory(void* storage) {
+     if (!storage) return nullptr;
+@@ -44,13 +54,20 @@ void* @PREFIX@_fx_factory(void* storage) {
+ // (8d501128) and reverb (8d501966) return parameter word 3; the mixer queries it
+ // at 8d510d5e and 8d510df4. Return the declared normalized Q31 control
+ // unchanged, or unity (stock's absent-object fallback) when no Dry is declared.
+-static opxy::i32 dry_level(void*, const opxy::i32* parameters) {
++// Stock's mixer asks each send for its dry level from two fixed call sites:
++// 8d510d5e for send A and 8d510df4 for send B. It applies send B's answer the
++// other way round, so a declared Dry is reported inverted when the query comes
++// from send B's call site (sdk_fx_dry), and behaves the same on both sends.
++static opxy::i32 dry_level(void* self, const opxy::i32* stock_parameters) {
++    (void)self;
++    const opxy::i32* parameters = stock_parameters;
+     (void)parameters;
+     return @DRY_LEVEL@;
+ }
+ const char @PREFIX@_fx_name[] = "@NAME@";
+ const char* @PREFIX@_fx_parameter_name(opxy::u32 index) {
+     static const char* const labels[] = {@LABELS@};
++    index = sdk_fx_slot(index);
+     return index < sizeof(labels) / sizeof(labels[0]) ? labels[index] : "";
+ }
+ // +0x00/+0x04 destructors, +0x08 unused, +0x0c insert process (unused by
+diff --git a/sdk/platform/opxy-1.2.1/screen_hooks.s b/sdk/platform/opxy-1.2.1/screen_hooks.s
+index bf09463..72de14f 100644
+--- a/sdk/platform/opxy-1.2.1/screen_hooks.s
++++ b/sdk/platform/opxy-1.2.1/screen_hooks.s
+@@ -46,6 +46,13 @@ sdk_fx_value:
+     [SP + 12] = R3;
+     R2 = R7;
+     CALL sdk_fx_value_text;
++    /* A nonzero result is a stand-in vector holding Page 2's stored values:
++     * the rest of this page (its later value texts and the bars, drawn from
++     * [P5 + 4]) then shows Page 2. Stock restores P5 when the page returns. */
++    CC = R0 == 0;
++    IF CC JUMP .Lfx_value_done;
++    P5 = R0;
++.Lfx_value_done:
+     SP += 16;
+     UNLINK;
+     RTS;
+diff --git a/sdk/platform/opxy-1.2.1/synth_controls.cpp b/sdk/platform/opxy-1.2.1/synth_controls.cpp
+index fab74de..22f81c0 100644
+--- a/sdk/platform/opxy-1.2.1/synth_controls.cpp
++++ b/sdk/platform/opxy-1.2.1/synth_controls.cpp
+@@ -119,6 +119,10 @@ u32 sdk_param_steps(u32 track, u32 index, u32* scale) {
+         *scale = 1;
+         return m->steps[index];
+     }
++    // Stock's step table covers a send's four shown positions only. Page 2's
++    // continuous slots (4..7) are not in it, so a turn would not move them:
++    // answer "continuous" (-1) with scale left at its preset of 2.
++    if (m && index >= 4 && (track == 14 || track == 15)) return 0xffffffffu;
+     return stock<u32(u32, u32, u32*)>(0x8c0b2468)(track, index, scale);
+ }
+ 
+@@ -148,28 +152,112 @@ u32 sdk_synth_turn(u32 project, u32 track, u32 index, u32 event) {
+     return stock<u32(u32, u32, u32, u32)>(0x8d5ad5bc)(project, track, index, event);
+ }
+ 
++// Send effects with five to eight controls: the stock send page edits only the
++// first four positions. Holding encoder 1 and turning it switches the page.
++// Page 2 edits slots 4..7 through stock's own parameter path (stored, stepped
++// and published to the audio vector by stock), so the effect receives them
++// unchanged. Page 2's value text reads the stored slot. Nothing here writes
++// stock's vector directly.
++static bool fx_page_two[2] = {false, false};
++static u32 fx_engine[2] = {0, 0};
++static u32 fx_project = 0x86bd027c;   // stock's project, as the LFO page uses it
++static bool fx_on_page_two(u32 track) {
++    const u32 t = track - 14;
++    if (fx_page_two[t] && track_engine(track) != fx_engine[t]) fx_page_two[t] = false;
++    return fx_page_two[t];
++}
++static void fx_switch_page(u32 track, bool page_two) {
++    const u32 t = track - 14;
++    if (fx_on_page_two(track) == page_two) return;
++    if (page_two) fx_engine[t] = track_engine(track);
++    fx_page_two[t] = page_two;
++}
++void sdk_fx_init(u32 track) __asm__("sdk_fx_init");
++void sdk_fx_init(u32) {}
++const opxy::i32* sdk_fx_route(u32 track, const opxy::i32* parameters, opxy::i32* routed) __asm__("sdk_fx_route");
++const opxy::i32* sdk_fx_route(u32, const opxy::i32* parameters, opxy::i32*) {
++    return parameters;
++}
++void sdk_fx_post(u32 track, opxy::i32* left, opxy::i32* right) __asm__("sdk_fx_post");
++void sdk_fx_post(u32, opxy::i32*, opxy::i32*) {}
++// Stock's mixer queries a send's dry level from two call sites; the one for
++// send B (CALL (P1) at 8d510df4, returning to 8d510df6) applies the answer
++// inverted, so it is reported inverted. The call site is identified by the
++// query's return address, not by any object or vector the mixer passes.
++opxy::i32 sdk_fx_dry(opxy::i32 value, const void* from) __asm__("sdk_fx_dry");
++opxy::i32 sdk_fx_dry(opxy::i32 value, const void* from) {
++    if (value < 0) value = 0;
++    return reinterpret_cast<opxy::platform::Address>(from) == 0x8d510df6u ? 0x7fffffff - value : value;
++}
++// The parameter slot a send page position edits and names.
++u32 sdk_fx_slot(u32 index) __asm__("sdk_fx_slot");
++u32 sdk_fx_slot(u32 index) {
++    const u32 track = selected_track();
++    return (track == 14 || track == 15) && index < 4 && fx_on_page_two(track) ? index + 4u : index;
++}
++
+ // 8c08fade: auxiliary-track page, including send FX tracks 14/15. Its controller
+ // folds Shift into the same 0..3 positions before this call, unlike instruments.
+ // Ownership is checked against the FX registry, not the synth registry.
+ u32 sdk_effect_turn(u32 project, u32 track, u32 index, u32 event) {
+     const SynthControls* m = (track == 14 || track == 15) && index < 4 ? owned(track_engine(track), true) : nullptr;
+-    if (m && event && (m->continuous & (1u << index)) && shift_held()) {
++    if (!m) return stock<u32(u32, u32, u32, u32)>(0x8d5ad5bc)(project, track, index, event);
++    if (project) fx_project = project;
++    if (index == 0 && event && encoder_held(0)) {
++        const opxy::i32* source = reinterpret_cast<const opxy::i32*>(event);
++        if (source[0] > 0) fx_switch_page(track, true);
++        else if (source[0] < 0) fx_switch_page(track, false);
++        return 0;
++    }
++    const u32 slot = fx_on_page_two(track) ? index + 4u : index;
++    if (event && (m->continuous & (1u << slot)) && shift_held()) {
+         const opxy::i32* source = reinterpret_cast<const opxy::i32*>(event);
+         const opxy::i32 fine[3] = {source[0] / 10, source[1], source[2]};
+-        return stock<u32(u32, u32, u32, const opxy::i32*)>(0x8d5ad5bc)(project, track, index, fine);
++        return stock<u32(u32, u32, u32, const opxy::i32*)>(0x8d5ad5bc)(project, track, slot, fine);
+     }
+-    return stock<u32(u32, u32, u32, u32)>(0x8d5ad5bc)(project, track, index, event);
++    return stock<u32(u32, u32, u32, u32)>(0x8d5ad5bc)(project, track, slot, event);
+ }
+ 
+ // 8d53b636: the send page sets each position's value text (stock's "%02i" of
+ // the word) with 0x8d6011f0(widget, text). An owned effect on a send track may
+-// name the value instead; the text is copied before this returns.
++// name the value instead; the text is copied before this returns. On Page 2 the
++// value is read from stock's stored parameter for the slot, and the result is
++// a stand-in vector of those stored values, which the hook stub puts in place
++// of the page's vector so the bars show Page 2 too. Zero keeps stock's vector.
++struct FxShownVector { u32 allocator; u32 begin, end, capacity; };
++static opxy::i32 fx_shown_words[8];
++static FxShownVector fx_shown_vector;
+ u32 sdk_fx_value_text(u32 widget, const char* text, u32 index, opxy::i32 value) {
+     static char caption[16];
+     const u32 track = selected_track();
+     const SynthControls* m = (track == 14 || track == 15) && index < 4 ? owned(track_engine(track), true) : nullptr;
+-    if (m && m->format(index, value, caption)) text = caption;
+-    return stock<u32(u32, const char*)>(0x8d6011f0)(widget, text);
++    const bool page_two = m && sdk_fx_slot(index) != index;
++    if (page_two && index == 0) {
++        for (u32 i = 0; i < 4; ++i) {
++            const opxy::i32 stored = stock<opxy::i32(u32, u32, u32)>(0x8d5ac910)(fx_project, track, i + 4);
++            fx_shown_words[i] = stored;
++            fx_shown_words[i + 4] = stored;
++        }
++        fx_shown_vector.allocator = 0;
++        fx_shown_vector.begin = reinterpret_cast<u32>(fx_shown_words);
++        fx_shown_vector.end = fx_shown_vector.begin + sizeof(fx_shown_words);
++        fx_shown_vector.capacity = fx_shown_vector.end;
++    }
++    if (m) {
++        const u32 slot = sdk_fx_slot(index);
++        const opxy::i32 shown = page_two ? fx_shown_words[index] : value;
++        if (m->format(slot, shown, caption)) text = caption;
++        else if (page_two) {
++            opxy::i32 pct = shown <= 0 ? 0 : shown / 21474837;   // stock prints 00..99
++            if (pct > 99) pct = 99;
++            caption[0] = static_cast<char>('0' + pct / 10);
++            caption[1] = static_cast<char>('0' + pct % 10);
++            caption[2] = 0;
++            text = caption;
++        }
++    }
++    stock<u32(u32, const char*)>(0x8d6011f0)(widget, text);
++    return page_two && index == 0 ? reinterpret_cast<u32>(&fx_shown_vector) : 0;
+ }
+ 
+ bool sdk_synth_value(u32 track, u32 slot, opxy::i32 value, char* text) {
+diff --git a/tooling/adapters.py b/tooling/adapters.py
+index 57745de..7bb1691 100644
+--- a/tooling/adapters.py
++++ b/tooling/adapters.py
+@@ -381,11 +381,11 @@ def generate_fx_object(directory, m, benchmark=False):
+     resources = m.definition['resources']
+     bytes_ = resources.get('bufferBytes')
+     if bytes_ is None:
+-        values = dict(OBJECT='struct Object { const void* const* vtable; State state; };\n'
++        values = dict(OBJECT='struct Object { const void* const* vtable; State state; opxy::u32 slot; };\n'
+                              'static_assert(sizeof(State) <= opxy::effect_state_bytes, "Effect state exceeds the stock FX slot");',
+-                      INIT='    (void)slot;', BUFFER='', RESET='')
++                      INIT='', BUFFER='', RESET='')
+     else:
+-        values = dict(OBJECT='struct Object { const void* const* vtable; State state; opxy::i32* buffer; };\n'
++        values = dict(OBJECT='struct Object { const void* const* vtable; State state; opxy::i32* buffer; opxy::u32 slot; };\n'
+                              'static_assert(sizeof(State) <= opxy::effect_buffered_state_bytes,\n'
+                              '              "Effect state exceeds the stock FX slot beside its buffer address");',
+                       INIT=FX_BUFFER_INIT.format(bytes=bytes_),
+@@ -399,7 +399,7 @@ def generate_fx_object(directory, m, benchmark=False):
+     path = expand('fx_object.cpp.in', dict(values, PREFIX=m.prefix, NAMESPACE=m.definition['id'],
+                                            NAME=m.native_name, LABELS=stock_labels(m),
+                                            DRY_LEVEL='0x7fffffff' if m.dry_parameter is None else
+-                                           f'parameters[{m.dry_parameter}]'),
++                                           f'sdk_fx_dry(parameters[{m.dry_parameter}], __builtin_return_address(0))'),
+                   Path(directory) / f'fx_object_{m.prefix}.cpp')
+     return append_callback(path, m) if benchmark else path
+ 
